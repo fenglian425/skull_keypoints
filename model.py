@@ -2,6 +2,8 @@ from config import Config
 import os
 import torch
 from yacs.config import CfgNode as CN
+from nets.pose_hrnet import PoseHighResolutionNet
+import torch.nn as nn
 
 _C = CN()
 
@@ -118,21 +120,83 @@ def update_config(cfg, file):
     cfg.freeze()
 
 
+import torchvision
+
+
+class HRONet(PoseHighResolutionNet):
+    def __init__(self, cfg, **kwargs):
+        super().__init__(cfg, **kwargs)
+
+        num_features = cfg['MODEL']['EXTRA']['STAGE4']['NUM_CHANNELS'][0]
+        self.offset_fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Linear(num_features, 2),
+        )
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.layer1(x)
+
+        x_list = []
+        for i in range(self.stage2_cfg['NUM_BRANCHES']):
+            if self.transition1[i] is not None:
+                x_list.append(self.transition1[i](x))
+            else:
+                x_list.append(x)
+        y_list = self.stage2(x_list)
+
+        x_list = []
+        for i in range(self.stage3_cfg['NUM_BRANCHES']):
+            if self.transition2[i] is not None:
+                x_list.append(self.transition2[i](y_list[-1]))
+            else:
+                x_list.append(y_list[i])
+        y_list = self.stage3(x_list)
+
+        x_list = []
+        for i in range(self.stage4_cfg['NUM_BRANCHES']):
+            if self.transition3[i] is not None:
+                x_list.append(self.transition3[i](y_list[-1]))
+            else:
+                x_list.append(y_list[i])
+        y_list = self.stage4(x_list)
+
+        x = self.final_layer(y_list[0])
+        offset = self.offset_fc(y_list[0])
+        return x, offset
+
+
 def get_model(cfg: Config):
-    if 'hrnet' in cfg.MODEL_TYPE:
+    if 'w' in cfg.MODEL_TYPE:
         from nets.pose_hrnet import get_pose_net
         if 'w32' in cfg.MODEL_TYPE:
             file = 'nets/hrnet/w32.yaml'
+            pretrain_model = 'weights/pose_hrnet_w32_384x288.pth'
         elif 'w48' in cfg.MODEL_TYPE:
             file = 'nets/hrnet/w48.yaml'
+            pretrain_model = 'weights/pose_hrnet_w48_384x288.pth'
+        elif 'w64' in cfg.MODEL_TYPE:
+            file = 'nets/hrnet/w64.yaml'
+            pretrain_model = None
 
         update_config(_C, file)
-        keypoint_model = get_pose_net(_C, is_train=True)
-        state_dict=torch.load('weights/pose_hrnet_w32_256x192.pth')
-        state_dict={k:v for k, v in state_dict.items() if 'final_layer' not in k}
 
-        keypoint_model.load_state_dict(state_dict, strict=False)
-    elif 'resnet' in cfg.MODEL_TYPE:
+        if 'hro' in cfg.MODEL_TYPE:
+            keypoint_model = HRONet(_C)
+        else:
+            keypoint_model = get_pose_net(_C, is_train=True)
+
+        if pretrain_model is not None:
+            state_dict = torch.load(pretrain_model)
+            state_dict = {k: v for k, v in state_dict.items() if 'final_layer' not in k}
+            keypoint_model.load_state_dict(state_dict, strict=False)
+
+    elif 'res' in cfg.MODEL_TYPE:
         from nets.pose_resnet import get_pose_net
 
     return keypoint_model
@@ -140,8 +204,12 @@ def get_model(cfg: Config):
 
 if __name__ == '__main__':
     from utils import get_parameter_number
+    from config import *
 
     cfg = Config()
+    cfg = ExW48()
+
+    cfg = HROW48()
     keypoint_model = get_model(cfg)
     print(keypoint_model)
     print(get_parameter_number(keypoint_model))

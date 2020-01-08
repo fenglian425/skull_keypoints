@@ -23,25 +23,16 @@ def train(cfg: Config, validate=False):
     os.makedirs(weight_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    acc = AverageMeter()
-
-    val_batch_time = AverageMeter()
-    val_data_time = AverageMeter()
-    val_losses = AverageMeter()
-    val_acc = AverageMeter()
-
     # switch to train mode
     model = get_model(cfg)
+    # print(model)
     model.cuda()
     train_loader, val_loader = get_loaders(cfg)
 
     if cfg.LOSS_TYPE == 'MSE':
         criterion = JointsMSELoss(use_target_weight=True)
     elif cfg.LOSS_TYPE == 'OHKM':
-        criterion = JointsOHKMMSELoss(use_target_weight=True)
+        criterion = JointsOHKMMSELoss(use_target_weight=True, topk=cfg.TopK)
 
     if cfg.OPTIMIZER == 'sgd':
         optimizer = optim.SGD(
@@ -61,12 +52,22 @@ def train(cfg: Config, validate=False):
     )
 
     for epoch in range(cfg.EPOCH):
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        acc = AverageMeter()
+
         lr_scheduler.step()
 
         end = time.time()
         model.train()
-        for i, (input, target, target_weight) in enumerate(train_loader):
+        for i, train_batch in enumerate(train_loader, start=1):
             # measure data loading time
+            if 'hro' in cfg.MODEL_TYPE:
+                input, target, target_weight, offsets= train_batch
+            else:
+                input, target, target_weight= train_batch
+
             data_time.update(time.time() - end)
 
             input = input.cuda(non_blocking=True)
@@ -102,7 +103,7 @@ def train(cfg: Config, validate=False):
             batch_time.update(time.time() - end)
             end = time.time()
 
-            if i % cfg.PRINT_FREQ == 0:
+            if i % cfg.PRINT_FREQ == 0 or i == len(train_loader):
                 msg = 'Epoch: [{0}][{1}/{2}]\t' \
                       'Time {batch_time.val:.3f}s ({batch_time.avg:.3f}s)\t' \
                       'Speed {speed:.1f} samples/s\t' \
@@ -130,19 +131,25 @@ def train(cfg: Config, validate=False):
 
         val_end = time.time()
         model.eval()
+
+        val_batch_time = AverageMeter()
+        val_data_time = AverageMeter()
+        val_losses = AverageMeter()
+        val_acc = AverageMeter()
         show = True
-        for i, (input, target, target_weight) in enumerate(val_loader):
+        for i, (input, target, target_weight) in enumerate(val_loader, start=1):
             # measure data loading time
             val_data_time.update(time.time() - val_end)
 
-            input = input.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            target_weight = target_weight.cuda(non_blocking=True)
-            # compute output
-            output = model(input)
-            loss = criterion(output, target, target_weight)
+            with torch.no_grad():
+                input = input.cuda(non_blocking=True)
+                target = target.cuda(non_blocking=True)
+                target_weight = target_weight.cuda(non_blocking=True)
+                # compute output
+                output = model(input)
+                loss = criterion(output, target, target_weight)
 
-            if show and epoch % cfg.SAVE_FREQ == 0:
+            if show == 0:
                 pred, pred_val = get_max_preds(output.detach().cpu().numpy())
                 gt, gt_val = get_max_preds(target.detach().cpu().numpy())
 
@@ -162,21 +169,9 @@ def train(cfg: Config, validate=False):
                 cv2.imwrite(os.path.join(tmp_dir, f'{epoch}.jpg'), np.concatenate([img_with_pred, img_with_gt], axis=1))
                 show = False
 
+            if epoch % cfg.SAVE_FREQ == 0:
                 torch.save(model.state_dict(), os.path.join(weight_dir, f'{epoch}.pth'))
 
-            # if isinstance(outputs, list):
-            #     loss = criterion(outputs[0], target, target_weight)
-            #     for output in outputs[1:]:
-            #         loss += criterion(output, target, target_weight)
-            # else:
-            #     output = outputs
-            #     loss = criterion(output, target, target_weight)
-
-            # loss = criterion(output, target, target_weight)
-
-            # compute gradient and do update step
-
-            # measure accuracy and record loss
             val_losses.update(loss.item(), input.size(0))
 
             _, avg_acc, cnt, pred = accuracy(output.detach().cpu().numpy(),
@@ -187,7 +182,7 @@ def train(cfg: Config, validate=False):
             val_batch_time.update(time.time() - val_end)
             val_end = time.time()
 
-            if i % cfg.PRINT_FREQ == 0:
+            if i % cfg.PRINT_FREQ == 0 or i == len(val_loader):
                 msg = 'Epoch: [{0}][{1}/{2}]\t' \
                       'Time {batch_time.val:.3f}s ({batch_time.avg:.3f}s)\t' \
                       'Speed {speed:.1f} samples/s\t' \
@@ -204,4 +199,11 @@ def train(cfg: Config, validate=False):
 if __name__ == '__main__':
     cfg = Config()
     cfg = Res512Config()
+    cfg = W48Res512Config()
+    cfg = W48Res512TopKConfig()
+    cfg = W48AugConfig()
+
+    cfg = W48Res512TopKFlipConfig()
+    cfg = W48Res512TopKFlipBlurConfig()
+    cfg = ExW48()
     train(cfg, validate=True)

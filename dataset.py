@@ -1,12 +1,12 @@
 from torch.utils.data import Dataset, DataLoader
-from config import Config
+from config import *
 import numpy as np
 import os
 from skimage.io import imread
 import cv2
 import imgaug as ia
 import imgaug.augmenters as iaa
-from utils import visualize_keypoints
+from utils import visualize_keypoints, resize_and_pad
 
 
 # 25-34 11 12 0 1
@@ -36,20 +36,31 @@ class KeyPointDataset(Dataset):
 
         self.joints_weight = np.ones((self.num_keypoints, 1), dtype=np.float32)
 
-        self.augmenter = iaa.Sometimes(0.4, [
+        self.augmentation_policies = [
             iaa.Multiply((0.8, 1.2)),  # change brightness, doesn't affect keypoints
             iaa.Affine(
                 translate_percent=(-cfg.SHIFT_FACTOR, cfg.SHIFT_FACTOR),
                 rotate=(-cfg.ROTATION_FACTOR, +cfg.ROTATION_FACTOR),
                 scale=(1 - cfg.SCALE_FACTOR, 1 + cfg.SCALE_FACTOR)
             )  # rotate by exactly 10deg and scale to 50-70%, affects keypoints
-        ])
+        ]
+
+        if self.cfg.FLIPLR:
+            self.augmentation_policies.append(iaa.Fliplr(0.5))
+
+        if self.cfg.BLUR:
+            self.augmentation_policies.append(iaa.GaussianBlur(sigma=(0., 3.)))
+
+        self.augmenter = iaa.Sometimes(0.4, self.augmentation_policies)
 
     def __len__(self):
         return len(self.list_ids)
 
     def __getitem__(self, index):
         img_file = self.list_ids[index]
+
+        # if '204' not in img_file:
+        #     return 0,0,0
         label_file = img_file.replace('jpg', 'txt')
 
         # image = imread(os.path.join(self.img_dir, img_file), as_gray=True)
@@ -75,50 +86,23 @@ class KeyPointDataset(Dataset):
         image = image[ymin:ymax, xmin: xmax]
         coords -= np.array([xmin, ymin])
 
-        # print((xmax - xmin) / (ymax - ymin),',')
-        # kps = ia.KeypointsOnImage([ia.Keypoint(x=c[0], y=c[1]) for c in coords], shape=image.shape)
-        # cv2.imshow('color',    cv2.imread(os.path.join(self.img_dir, img_file)))
-        # cv2.imshow('crop', kps.draw_on_image(image))
-
         # normalize
         side_length = int(self.image_size[0] * 1.)
-        height, width = image.shape[:2]
-        ratio = width / height
-
-        if width > height:
-            scale = width / side_length
-            width = side_length
-            height = int(side_length / ratio)
-        else:
-            scale = height / side_length
-            width = int(side_length * ratio)
-            height = side_length
-
-        # cv2.imshow('ori', image)
-        image = cv2.resize(image, (width, height))
-        # cv2.imshow('resize', image)
-        # cv2.waitKey()
-        # print(height, width, ratio, width / height, scale, self.image_size[0])
-        # print(coords, ratio)
-
-        coords /= scale
+        image, coords, _ = resize_and_pad(image, side_length, kps=coords)
         kps = ia.KeypointsOnImage([ia.Keypoint(x=c[0], y=c[1]) for c in coords], shape=image.shape)
 
-        image, kps = self.normalize(image=image, keypoints=kps)
-        # image = self.crop_center.augment_image(image)
-        # kps = self.crop_center.augment_keypoints(kps)
-
         if self.is_train:
-            # image_before = visualize_keypoints(image, kps)
+            if self.cfg.TEST:
+                image_before = visualize_keypoints(image, kps, self.cfg.SHOW_SCALE)
+                image, kps = self.augmenter(image=image, keypoints=kps)
+                image_after = visualize_keypoints(image, kps, self.cfg.SHOW_SCALE)
+                cv2.imshow('before', image_before)
+                cv2.imshow('after', image_after)
+                cv2.waitKey()
+            else:
+                image, kps = self.augmenter(image=image, keypoints=kps)
 
-            image, kps = self.augmenter(image=image, keypoints=kps)
-
-            # image_after = visualize_keypoints(image, kps)
-            # cv2.imshow('before', image_before[..., [2, 1, 0]])
-            # cv2.imshow('after', image_after[..., [2, 1, 0]])
-            # cv2.waitKey()
-
-        heatmap, target_weight = self.generate_target(kps.keypoints)
+        heatmap, target_weight, offsets = self.generate_target(kps.keypoints)
         # print(target_weight.flatten())
 
         # if not target_weight.all():
@@ -140,10 +124,14 @@ class KeyPointDataset(Dataset):
 
         image = image / 255
         image = np.transpose(image.astype(np.float32), (2, 0, 1))
+
+        if 'hro' in self.cfg.MODEL_TYPE:
+            return image, heatmap, target_weight, offsets
         return image, heatmap, target_weight
 
     def generate_target(self, coords):
         target_weight = np.ones((self.num_keypoints, 1), dtype=np.float32)
+        offsets = np.zeros((self.num_keypoints, 2), dtype=np.float32)
         tmp_size = self.sigma * 3
 
         target = np.zeros((self.num_keypoints,
@@ -153,8 +141,13 @@ class KeyPointDataset(Dataset):
 
         for joint_id in range(self.num_keypoints):
             feat_stride = np.array(self.image_size) / np.array(self.heatmap_size)
-            mu_x = int(coords[joint_id].x / feat_stride[0] + 0.5)
-            mu_y = int(coords[joint_id].y / feat_stride[1] + 0.5)
+
+            x, y = coords[joint_id].x / feat_stride[0], coords[joint_id].y / feat_stride[1]
+            mu_x = int(x + 0.5)
+            mu_y = int(y + 0.5)
+
+            print(x, y, mu_x, mu_y)
+            offsets[joint_id] = (x - mu_x, y - mu_y)
             # Check that any part of the gaussian is in-bounds
             ul = [int(mu_x - tmp_size), int(mu_y - tmp_size)]
             br = [int(mu_x + tmp_size + 1), int(mu_y + tmp_size + 1)]
@@ -184,7 +177,7 @@ class KeyPointDataset(Dataset):
             if v > 0.5:
                 target[joint_id][img_y[0]:img_y[1], img_x[0]:img_x[1]] = \
                     g[g_y[0]:g_y[1], g_x[0]:g_x[1]]
-        return target, target_weight
+        return target, target_weight, offsets
 
 
 def get_dataset(cfg):
@@ -217,8 +210,20 @@ if __name__ == '__main__':
     import matplotlib.pyplot as plt
 
     cfg = Config()
+    cfg = Res512Config()
+    cfg = W48AugConfig()
+    cfg = W48HM256Config()
+
+    cfg = W48Res512TopKFlipConfig()
+    cfg = W48Res512TopKFlipBlurConfig()
+    cfg.TEST = True
+
     train_dataset, val_dataset = get_dataset(cfg)
+    # train_dataset.coco.to_json()
+    # val_dataset.coco.to_json()
 
     for image, heatmap, target_weight in train_dataset:
+        # print(image.shape)
+        # print(heatmap.shape)
         # cv2.imshow('image', image)
         pass

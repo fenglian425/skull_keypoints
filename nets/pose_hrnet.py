@@ -14,7 +14,6 @@ import logging
 import torch
 import torch.nn as nn
 
-
 BN_MOMENTUM = 0.1
 logger = logging.getLogger(__name__)
 
@@ -140,7 +139,7 @@ class HighResolutionModule(nn.Module):
                          stride=1):
         downsample = None
         if stride != 1 or \
-           self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
+                self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
             downsample = nn.Sequential(
                 nn.Conv2d(
                     self.num_inchannels[branch_index],
@@ -203,14 +202,14 @@ class HighResolutionModule(nn.Module):
                                 1, 1, 0, bias=False
                             ),
                             nn.BatchNorm2d(num_inchannels[i]),
-                            nn.Upsample(scale_factor=2**(j-i), mode='nearest')
+                            nn.Upsample(scale_factor=2 ** (j - i), mode='nearest')
                         )
                     )
                 elif j == i:
                     fuse_layer.append(None)
                 else:
                     conv3x3s = []
-                    for k in range(i-j):
+                    for k in range(i - j):
                         if k == i - j - 1:
                             num_outchannels_conv3x3 = num_inchannels[i]
                             conv3x3s.append(
@@ -354,10 +353,10 @@ class PoseHighResolutionNet(nn.Module):
                     transition_layers.append(None)
             else:
                 conv3x3s = []
-                for j in range(i+1-num_branches_pre):
+                for j in range(i + 1 - num_branches_pre):
                     inchannels = num_channels_pre_layer[-1]
                     outchannels = num_channels_cur_layer[i] \
-                        if j == i-num_branches_pre else inchannels
+                        if j == i - num_branches_pre else inchannels
                     conv3x3s.append(
                         nn.Sequential(
                             nn.Conv2d(
@@ -484,12 +483,71 @@ class PoseHighResolutionNet(nn.Module):
             need_init_state_dict = {}
             for name, m in pretrained_state_dict.items():
                 if name.split('.')[0] in self.pretrained_layers \
-                   or self.pretrained_layers[0] is '*':
+                        or self.pretrained_layers[0] is '*':
                     need_init_state_dict[name] = m
             self.load_state_dict(need_init_state_dict, strict=False)
         elif pretrained:
             logger.error('=> please download pre-trained nets first!')
             raise ValueError('{} is not exist!'.format(pretrained))
+
+
+class ExHRNet(PoseHighResolutionNet):
+    def __init__(self, cfg, **kwargs):
+        self.inplanes = 64
+        extra = cfg.MODEL.EXTRA
+        super(PoseHighResolutionNet, self).__init__()
+
+        # stem net
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1,
+                               bias=False)
+        self.bn2 = nn.BatchNorm2d(64, momentum=BN_MOMENTUM)
+        self.relu = nn.ReLU(inplace=True)
+        self.layer1 = self._make_layer(Bottleneck, 64, 4)
+
+        self.stage2_cfg = cfg['MODEL']['EXTRA']['STAGE2']
+        num_channels = self.stage2_cfg['NUM_CHANNELS']
+        block = blocks_dict[self.stage2_cfg['BLOCK']]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))
+        ]
+        self.transition1 = self._make_transition_layer([256], num_channels)
+        self.stage2, pre_stage_channels = self._make_stage(
+            self.stage2_cfg, num_channels)
+
+        self.stage3_cfg = cfg['MODEL']['EXTRA']['STAGE3']
+        num_channels = self.stage3_cfg['NUM_CHANNELS']
+        block = blocks_dict[self.stage3_cfg['BLOCK']]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))
+        ]
+        self.transition2 = self._make_transition_layer(
+            pre_stage_channels, num_channels)
+        self.stage3, pre_stage_channels = self._make_stage(
+            self.stage3_cfg, num_channels)
+
+        self.stage4_cfg = cfg['MODEL']['EXTRA']['STAGE4']
+        num_channels = self.stage4_cfg['NUM_CHANNELS']
+        block = blocks_dict[self.stage4_cfg['BLOCK']]
+        num_channels = [
+            num_channels[i] * block.expansion for i in range(len(num_channels))
+        ]
+        self.transition3 = self._make_transition_layer(
+            pre_stage_channels, num_channels)
+        self.stage4, pre_stage_channels = self._make_stage(
+            self.stage4_cfg, num_channels, multi_scale_output=False)
+
+        self.final_layer = nn.Conv2d(
+            in_channels=pre_stage_channels[0],
+            out_channels=cfg.MODEL.NUM_JOINTS,
+            kernel_size=extra.FINAL_CONV_KERNEL,
+            stride=1,
+            padding=1 if extra.FINAL_CONV_KERNEL == 3 else 0
+        )
+
+        self.pretrained_layers = cfg['MODEL']['EXTRA']['PRETRAINED_LAYERS']
 
 
 def get_pose_net(cfg, is_train, **kwargs):
@@ -499,4 +557,3 @@ def get_pose_net(cfg, is_train, **kwargs):
     #     model.init_weights(cfg.MODEL.PRETRAINED)
 
     return model
-
